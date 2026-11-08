@@ -285,3 +285,7 @@ Set the option data via a dictionary object.
 
 [releases-link]: https://github.com/michull/pyelternportal/releases
 [releases-shield]: https://img.shields.io/github/release/michull/pyelternportal.svg?style=for-the-badge&include_prereleases
+
+## Prepared portal extensions
+
+This development branch adds `PortalClient` and the small `MessageCountClient` API. See [release evidence and scope](docs/RELEASE_EVIDENCE.md). It is not yet an upstream or PyPI release.

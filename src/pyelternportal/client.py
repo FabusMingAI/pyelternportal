@@ -1,0 +1,1156 @@
+"""Zugriff auf das Eltern-Portal (eltern-portal.org).
+
+Baut auf der Bibliothek ``pyelternportal`` auf, ergänzt aber, was ein
+die Integration braucht und die Bibliothek nicht liefert:
+
+* stabile IDs für Nachrichten und Aushänge,
+* Download-Links von Elternbrief-PDFs und Nachrichten-Anhängen,
+* das Herunterladen der Dateien innerhalb derselben Portal-Sitzung,
+* die Stundenplankürzel der Lehrkräfte (Service → Schulinformationen).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import html
+import logging
+import re
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from typing import Any
+from urllib import parse
+
+import aiohttp
+import bs4
+
+import pyelternportal
+from pyelternportal import ElternPortalAPI
+from pyelternportal.exception import (
+    BadCredentialsException,
+    CannotConnectException,
+    ResolveHostnameException,
+    StudentListException,
+)
+
+from .registrations import parse_course_registrations
+
+LOGGER = logging.getLogger(__name__)
+KIND_BLACKBOARD = "schwarzes_brett"
+KIND_LETTER = "elternbrief"
+KIND_MESSAGE = "nachricht"
+KIND_POLL = "umfrage"
+
+
+MAX_FILE_SIZE = 25 * 1024 * 1024
+# Seite mit den Stundenplankürzeln der Lehrkräfte (Abschnitt in den Schulinformationen)
+TEACHERS_PATH = "service/schulinformationen"
+# Bereiche, die nicht jede Schule anbietet: Netzwerkfehler dort brechen den Abruf nicht ab
+OPTIONAL_SECTIONS = frozenset({"lesson", "substitution", "sicknote"})
+
+PortalAuthError = BadCredentialsException
+PortalConnectionError = (
+    CannotConnectException,
+    ResolveHostnameException,
+    StudentListException,
+    aiohttp.ClientError,
+    TimeoutError,
+)
+
+
+@dataclass
+class PortalFile:
+    """Eine heruntergeladene Datei."""
+
+    name: str
+    content: bytes
+    content_type: str | None = None
+
+
+@dataclass
+class PortalAttachment:
+    """Verweis auf einen Anhang im Portal."""
+
+    name: str | None
+    href: str
+
+
+@dataclass
+class PortalItem:
+    """Ein Eingang aus dem Portal (Brief, Nachricht, Aushang, Umfrage)."""
+
+    uid: str
+    kind: str
+    title: str
+    body: str
+    sent: datetime | None
+    url: str
+    sender: str | None = None
+    version: str | None = None
+    attachments: list[PortalAttachment] = field(default_factory=list)
+    files: list[PortalFile] = field(default_factory=list)
+    meta: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PortalChild:
+    """Ein Kind mit allen Daten aus einem Portal."""
+
+    student_id: str
+    fullname: str
+    firstname: str
+    classname: str | None
+    items: list[PortalItem] = field(default_factory=list)
+    appointments: list[dict[str, Any]] = field(default_factory=list)
+    # Stundenplan: None = nicht gelesen (Fehler), sonst Liste der Stunden
+    timetable: list[dict[str, Any]] | None = None
+    course_registrations: list[str] | None = None
+    # Vertretungsplan: None = nicht gelesen (Fehler), sonst Tage mit Einträgen
+    substitutions: dict[str, Any] | None = None
+    # Krankmeldungen: None = nicht gelesen (Fehler), sonst Liste {start, end, comment}
+    sicknotes: list[dict[str, Any]] | None = None
+
+
+@dataclass
+class PortalResult:
+    """Ergebnis eines Abrufs."""
+
+    school: str
+    school_name: str
+    base_url: str
+    children: list[PortalChild]
+    errors: list[str] = field(default_factory=list)
+    # Stundenplankürzel -> Name; None = nicht abgerufen oder Fehler
+    teachers: dict[str, str] | None = None
+
+
+def school_from_input(value: str) -> str:
+    """Schulkennung aus Eingabe oder kompletter Portal-URL ermitteln.
+
+    ``https://bspgym.eltern-portal.org?username=...`` -> ``bspgym``
+    """
+    value = value.strip().lower()
+    if "eltern-portal.org" in value:
+        if "://" not in value:
+            value = "https://" + value
+        host = parse.urlparse(value).hostname or ""
+        return host.split(".")[0]
+    return value
+
+
+def _stable_id(*parts: Any) -> str:
+    raw = "|".join(str(p) for p in parts)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def _filename_from_response(resp: aiohttp.ClientResponse, fallback: str) -> str:
+    disp = resp.headers.get("Content-Disposition", "")
+    match = re.search(r"filename\*\s*=\s*[^']*''([^;]+)", disp, re.IGNORECASE)
+    if match:
+        return parse.unquote(match.group(1)).strip('"')
+    match = re.search(r'filename\s*=\s*"?([^";]+)"?', disp, re.IGNORECASE)
+    if match:
+        name = match.group(1)
+        try:  # Portale liefern Umlaute gerne als latin-1
+            name = name.encode("latin-1").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+        return name
+    return fallback
+
+
+class PortalClient(ElternPortalAPI):
+    """Erweiterter Portal-Client für genau ein Eltern-Portal."""
+
+    def __init__(
+        self,
+        session: aiohttp.ClientSession,
+        school: str,
+        username: str,
+        password: str,
+        lookback_days: int = 120,
+    ) -> None:
+        super().__init__(session)
+        self.set_config(school, username, password)
+        self.set_option(
+            appointment=True,
+            blackboard=True,
+            letter=True,
+            message=True,
+            poll=True,
+            lesson=True,
+            substitution=True,
+            sicknote=True,
+        )
+        neg = -abs(int(lookback_days))
+        self.set_option_threshold(
+            blackboard_threshold=neg,
+            letter_threshold=neg,
+            message_threshold=neg,
+            poll_threshold=neg,
+        )
+        self._letter_links: dict[str, str] = {}
+        self._timetable: list[dict[str, Any]] = []
+        self._subst: dict[str, Any] = {"days": [], "stand": None, "available": False}
+        self._extra_messages: list[PortalItem] = []
+        self._blackboard_items: list[PortalItem] = []
+        self._keep_session = False
+
+    # ------------------------------------------------------------------
+    # Sitzung
+    # ------------------------------------------------------------------
+    async def async_logout_online(self) -> None:
+        """Logout erst nach den Downloads (siehe async_fetch)."""
+        if self._keep_session:
+            return
+        await super().async_logout_online()
+
+    # ------------------------------------------------------------------
+    # Elternbriefe: zusätzlich den Download-Link merken
+    # ------------------------------------------------------------------
+    async def async_letter_parse(self, html: str) -> None:
+        await super().async_letter_parse(html)
+        self._letter_links = {}
+        soup = bs4.BeautifulSoup(html, self._beautiful_soup_parser)
+        for tag in soup.select(".link_nachrichten"):
+            match = re.search(r"\d+", tag.get("onclick") or "")
+            href = tag.get("href")
+            if match and href:
+                self._letter_links[match[0]] = href
+
+    # ------------------------------------------------------------------
+    # Stundenplan: eigene Auswertung mit Uhrzeiten und Mehrfach-Kursen
+    # ------------------------------------------------------------------
+    async def async_lesson_parse(self, html: str) -> None:
+        self._timetable = parse_timetable(html, self._beautiful_soup_parser)
+        self._student.lessons = []
+
+    # ------------------------------------------------------------------
+    # Vertretungsplan: eigene Auswertung (behält das ursprüngliche Fach,
+    # erkennt Entfall und auch Tage ohne Vertretung)
+    # ------------------------------------------------------------------
+    async def async_substitution_parse(self, html: str) -> None:
+        self._subst = parse_substitutions(html, self._beautiful_soup_parser)
+        self._student.substitutions = []
+
+    # ------------------------------------------------------------------
+    # Nachrichten Eltern/Fachlehrer: eigene Auswertung mit ID + Anhängen
+    # ------------------------------------------------------------------
+    async def async_message_parse(self, html: str) -> None:
+        self._student.messages = []
+        self._extra_messages = []
+        soup = bs4.BeautifulSoup(html, self._beautiful_soup_parser)
+        rows = soup.select("#messages-fachlehrer-table tbody tr.message-row")
+        for row in rows:
+            cells = row.find_all("td", recursive=False)
+            match = re.search(
+                r"showMessageFachlehrer\((\d+),\s*(\d+)\)", row.get("onclick", "")
+            )
+            if len(cells) < 4 or match is None:
+                continue
+            sender = cells[0].get_text(strip=True)
+            subject = cells[2].get_text(strip=True)
+            text = cells[3].get_text()
+            sent = None
+            if md := re.search(r"\d{2}\.\d{2}\.\d{4}", text):
+                mt = re.search(r"\d{2}:\d{2}", text)
+                sent = datetime.strptime(
+                    f"{md[0]} {mt[0] if mt else '00:00'}", "%d.%m.%Y %H:%M"
+                )
+            path = f"meldungen/kommunikation_fachlehrer/{match[1]}/{match[2]}"
+            if self._demo:
+                from pyelternportal.demo import DEMO_HTML_MESSAGE_DETAIL
+
+                detail_html = DEMO_HTML_MESSAGE_DETAIL
+            else:
+                async with self._session.get(
+                    parse.urljoin(self.base_url, path)
+                ) as resp:
+                    detail_html = await resp.text()
+            d_subject, body, attachments = self._parse_message_detail(detail_html)
+            native = f"{match[1]}_{match[2]}"
+            self._extra_messages.append(
+                PortalItem(
+                    uid=self._uid(KIND_MESSAGE, native),
+                    kind=KIND_MESSAGE,
+                    title=d_subject or subject or "Nachricht",
+                    body=body or "",
+                    sent=sent,
+                    sender=sender,
+                    url=parse.urljoin(self.base_url, path),
+                    version=_stable_id(sent, body),
+                    attachments=attachments,
+                )
+            )
+
+    def _parse_message_detail(
+        self, html: str
+    ) -> tuple[str | None, str, list[PortalAttachment]]:
+        soup = bs4.BeautifulSoup(html, self._beautiful_soup_parser)
+        subject = None
+        parts: list[str] = []
+        attachments: list[PortalAttachment] = []
+        grid = soup.select_one("#message-thread-grid")
+        if grid is None:
+            return None, "", []
+        for row in grid.select(":scope > div.row"):
+            cols = row.find_all("div", recursive=False)
+            if len(cols) < 2:
+                continue
+            head = cols[0].get_text(" ", strip=True)
+            if head.startswith("Betreff"):
+                subject = cols[1].get_text(strip=True)
+                continue
+            segment = cols[1].select_one("div.ui.segment")
+            if segment is None:
+                continue
+            for link in segment.find_all("a", href=True):
+                href = link["href"]
+                if href.startswith(("mailto:", "#", "javascript")):
+                    continue
+                if (
+                    href.startswith(("http://", "https://"))
+                    and "eltern-portal.org" not in href
+                ):
+                    link.append(f" ({href})")  # externer Link: im Text behalten
+                    continue
+                attachments.append(
+                    PortalAttachment(
+                        name=link.get_text(strip=True) or link.get("title"), href=href
+                    )
+                )
+            for node in segment.find_all(string=True):
+                node.replace_with(re.sub(r"\s+", " ", node))
+            for br in segment.find_all("br"):
+                br.replace_with("\n")
+            text = re.sub(r" *\n *", "\n", segment.get_text())
+            text = re.sub(r"\n{3,}", "\n\n", text).strip()
+            author = head.rstrip(":")
+            parts.append(f"— {author}:\n{text}")
+        # Anhänge außerhalb der Textblöcke (z.B. eigene Zeile "Anhang")
+        for link in grid.select("a[href*='get_file'], a[href*='download']"):
+            href = link["href"]
+            if not any(a.href == href for a in attachments):
+                attachments.append(
+                    PortalAttachment(
+                        name=link.get_text(strip=True) or link.get("title"), href=href
+                    )
+                )
+        return subject, "\n\n".join(parts), attachments
+
+    async def async_blackboard_parse(self, html: str) -> None:
+        """Aushänge ohne feste Positionen für Text und Anhänge auswerten (#30)."""
+        self._student.blackboards = []
+        self._blackboard_items = []
+        soup = bs4.BeautifulSoup(html, self._beautiful_soup_parser)
+        threshold = date.today() + timedelta(days=self.blackboard_threshold)
+        for card in soup.select("#asam_content .grid .grid-item .well"):
+            heading = card.find(["h4", "h3"])
+            if heading is None:
+                continue
+            title = heading.get_text(" ", strip=True) or "Aushang"
+            stamp = card.find(string=re.compile(r"eingestellt am", re.IGNORECASE))
+            match = re.search(
+                r"eingestellt am (\d{2}\.\d{2}\.\d{4})", str(stamp), re.IGNORECASE
+            )
+            sent = None
+            if match:
+                try:
+                    sent = datetime.strptime(match[1], "%d.%m.%Y").date()
+                except ValueError:
+                    pass
+            if sent is not None and sent < threshold:
+                continue
+            native = _stable_id(
+                sent, title
+            )  # gleiche IDs wie bisher: gespeicherte Zustände behalten
+            heading.decompose()
+            if stamp is not None:
+                stamp.extract()
+            attachments: list[PortalAttachment] = []
+            fingerprints: list[str] = []
+            for link in card.find_all("a", href=True):
+                href = link["href"]
+                url = parse.urlsplit(parse.urljoin(self.base_url, href))
+                if url.netloc != parse.urlsplit(self.base_url).netloc:
+                    continue
+                if not (
+                    "get_file" in url.path
+                    or "download" in url.path
+                    or url.path.lower().endswith((".pdf", ".png", ".jpg", ".jpeg"))
+                    or link.has_attr("download")
+                ):
+                    continue
+                if not any(att.href == href for att in attachments):
+                    name = link.get_text(" ", strip=True) or link.get("title")
+                    attachments.append(PortalAttachment(name, href))
+                    # Sitzungsabhängige CSRF-Parameter sind keine Inhaltsänderung.
+                    query = parse.urlencode(
+                        sorted(
+                            (k, v)
+                            for k, v in parse.parse_qsl(url.query)
+                            if "csrf" not in k.lower()
+                        )
+                    )
+                    fingerprints.append(parse.urlunsplit(("", "", url.path, query, "")))
+                link.decompose()
+            for node in card.select("script, style"):
+                node.decompose()
+            for br in card.find_all("br"):
+                br.replace_with("\n")
+            for block in card.find_all(["p", "div", "li"]):
+                block.append("\n")
+            body = re.sub(r"[ \t]+", " ", card.get_text())
+            body = "\n".join(
+                line.strip()
+                for line in body.splitlines()
+                if line.strip() not in ("", "Anhang:", "Anhänge:")
+            )
+            self._blackboard_items.append(
+                PortalItem(
+                    uid=self._uid(KIND_BLACKBOARD, native),
+                    kind=KIND_BLACKBOARD,
+                    title=title,
+                    body=body,
+                    sent=datetime.combine(sent, datetime.min.time()) if sent else None,
+                    url=parse.urljoin(self.base_url, "aktuelles/schwarzes_brett"),
+                    version=_stable_id(body, *sorted(fingerprints)),
+                    attachments=attachments,
+                )
+            )
+
+    # ------------------------------------------------------------------
+    # Abruf
+    # ------------------------------------------------------------------
+    def _uid(self, kind: str, native: str) -> str:
+        return f"{self.school}-{self._student.student_id}-{kind}-{native}"
+
+    async def _section(self, name: str, coro_factory: Callable[[], Any]) -> str | None:
+        try:
+            await coro_factory()
+        except (aiohttp.ClientError, TimeoutError) as err:
+            if name not in OPTIONAL_SECTIONS:
+                raise
+            # Zusatzbereiche (Stundenplan, Vertretungen, Krankmeldungen) sind nicht
+            # bei jeder Schule freigeschaltet; manche Portale trennen dann die
+            # Verbindung. Das darf den Abruf der übrigen Bereiche nicht abbrechen.
+            LOGGER.debug("%s: Bereich '%s' nicht verfügbar: %s", self.school, name, err)
+            return f"{name}: nicht verfügbar ({err or type(err).__name__})"
+        except Exception as err:  # noqa: BLE001 - Portal-HTML ändert sich gern
+            LOGGER.debug(
+                "%s: Bereich '%s' konnte nicht gelesen werden: %s",
+                self.school,
+                name,
+                err,
+            )
+            return f"{name}: {err}"
+        return None
+
+    async def async_teachers_online(self) -> dict[str, str]:
+        """Stundenplankürzel der Lehrkräfte (leer, wenn die Schule sie nicht zeigt)."""
+        async with self._session.get(
+            parse.urljoin(self.base_url, TEACHERS_PATH)
+        ) as resp:
+            resp.raise_for_status()
+            html = await resp.text()
+        return parse_teachers(html, self._beautiful_soup_parser) or {}
+
+    async def async_course_registrations_online(self) -> list[str] | None:
+        """Read the existing registrations without submitting the booking form."""
+        url = parse.urljoin(self.base_url, "/buchungen/intensivierungskurse")
+        async with self._session.get(url) as resp:
+            resp.raise_for_status()
+            return parse_course_registrations(
+                await resp.text(), self._beautiful_soup_parser
+            )
+
+    async def async_fetch(
+        self,
+        need_download: Callable[[PortalItem], bool] | None = None,
+        teachers: bool = False,
+    ) -> PortalResult:
+        """Alles abrufen und gewünschte Anhänge in derselben Sitzung laden.
+
+        ``teachers`` liest zusätzlich die Stundenplankürzel der Lehrkräfte.
+        """
+        errors: list[str] = []
+        children: list[PortalChild] = []
+        teacher_list: dict[str, str] | None = None
+        self._keep_session = True
+        try:
+            if self._demo:
+                await self.async_base_demo()
+                await self.async_login_demo()
+            else:
+                await self.async_base_online()
+                await self.async_login_online()
+                if teachers:
+                    try:
+                        teacher_list = await self.async_teachers_online()
+                    except Exception as err:  # noqa: BLE001 - optional, Abruf läuft weiter
+                        LOGGER.info(
+                            "%s: Lehrkräfte-Kürzel nicht lesbar: %s", self.school, err
+                        )
+                        errors.append(f"lehrkraefte: {err or type(err).__name__}")
+
+            for st in self.students:
+                self._student = st
+                if not self._demo:
+                    await self.async_set_child_online()
+                sfx = "demo" if self._demo else "online"
+                failed: set[str] = set()
+                self._timetable = []
+                self._blackboard_items = []
+                self._subst = {"days": [], "stand": None, "available": False}
+                for name in (
+                    "appointment",
+                    "letter",
+                    "message",
+                    "blackboard",
+                    "poll",
+                    "lesson",
+                    "substitution",
+                    "sicknote",
+                ):
+                    method = getattr(self, f"async_{name}_{sfx}")
+                    if err := await self._section(name, method):
+                        errors.append(err)
+                        failed.add(name)
+
+                child = PortalChild(
+                    student_id=st.student_id,
+                    fullname=st.fullname,
+                    firstname=st.firstname,
+                    classname=st.classname,
+                )
+                if not self._demo:
+                    try:
+                        child.course_registrations = (
+                            await self.async_course_registrations_online()
+                        )
+                    except Exception:  # noqa: BLE001 - optional page can use a different layout
+                        LOGGER.debug("%s: Kursanmeldungen nicht lesbar", self.school)
+                child.items = self._collect_items()
+                if "lesson" not in failed:
+                    child.timetable = list(self._timetable)
+                if "substitution" not in failed:
+                    child.substitutions = dict(self._subst)
+                if "sicknote" not in failed:
+                    child.sicknotes = [
+                        {
+                            "start": n.start.isoformat(),
+                            "end": (n.end or n.start).isoformat(),
+                            "comment": n.comment,
+                        }
+                        for n in getattr(st, "sicknotes", [])
+                        if n.start
+                    ]
+                child.appointments = [
+                    portal_appointment(
+                        f"{self.school}-{st.student_id}-termin-{a.appointment_id}",
+                        a.short,
+                        a.title,
+                        a.classname,
+                        a.start,
+                        a.end,
+                    )
+                    for a in st.appointments
+                ]
+                if need_download and not self._demo:
+                    for item in child.items:
+                        if item.attachments and need_download(item):
+                            await self._download_item(item)
+                children.append(child)
+        finally:
+            self._keep_session = False
+            self._student = None
+            if not self._demo:
+                try:
+                    await super().async_logout_online()
+                except Exception:
+                    LOGGER.debug("Logout fehlgeschlagen", exc_info=True)
+
+        return PortalResult(
+            school=self.school,
+            school_name=self.school_name or self.school,
+            base_url=self.base_url,
+            children=children,
+            errors=errors,
+            teachers=teacher_list,
+        )
+
+    def _collect_items(self) -> list[PortalItem]:
+        st = self._student
+        items: list[PortalItem] = []
+        for letter in st.letters:
+            href = self._letter_links.get(letter.letter_id)
+            items.append(
+                PortalItem(
+                    uid=self._uid(KIND_LETTER, letter.letter_id),
+                    kind=KIND_LETTER,
+                    title=letter.subject or f"Elternbrief {letter.number}",
+                    body=letter.body or "",
+                    sent=letter.sent,
+                    url=parse.urljoin(self.base_url, "aktuelles/elternbriefe"),
+                    version=_stable_id(letter.sent, letter.subject, letter.body),
+                    attachments=[PortalAttachment(letter.subject, href)]
+                    if href
+                    else [],
+                    meta={
+                        "nummer": letter.number,
+                        "empfang_bestaetigt": not letter.new,
+                        "verteiler": letter.distribution,
+                    },
+                )
+            )
+        items.extend(self._extra_messages)
+        items.extend(self._blackboard_items)
+        for poll in st.polls:
+            native = (poll.href or poll.title or "").rsplit("/", 1)[-1]
+            atts = []
+            if poll.attachment and poll.attachment.href:
+                atts.append(
+                    PortalAttachment(poll.attachment.name, poll.attachment.href)
+                )
+            items.append(
+                PortalItem(
+                    uid=self._uid(KIND_POLL, native or _stable_id(poll.title)),
+                    kind=KIND_POLL,
+                    title=poll.title or "Umfrage",
+                    body=(poll.detail or "").strip(),
+                    sent=None,
+                    url=parse.urljoin(self.base_url, (poll.href or "").lstrip("/"))
+                    if poll.href
+                    else parse.urljoin(self.base_url, "aktuelles/umfragen"),
+                    version=_stable_id(poll.title, poll.detail),
+                    attachments=atts,
+                    meta={
+                        "ende": poll.end.isoformat() if poll.end else None,
+                        "abgestimmt": poll.vote.isoformat() if poll.vote else None,
+                    },
+                )
+            )
+        return items
+
+    async def _download_item(self, item: PortalItem) -> None:
+        for idx, att in enumerate(item.attachments, start=1):
+            url = parse.urljoin(self.base_url, att.href.lstrip("/"))
+            try:
+                async with self._session.get(url) as resp:
+                    if resp.status != 200:
+                        LOGGER.warning("Download %s: HTTP %s", url, resp.status)
+                        continue
+                    ctype = resp.headers.get("Content-Type", "").split(";")[0]
+                    if ctype == "text/html":
+                        LOGGER.warning("Download %s lieferte HTML statt Datei", url)
+                        continue
+                    if (resp.content_length or 0) > MAX_FILE_SIZE:
+                        LOGGER.warning("Anhang zu groß, übersprungen: %s", url)
+                        continue
+                    content = await resp.read()
+                    if len(content) > MAX_FILE_SIZE:
+                        LOGGER.warning("Anhang zu groß, übersprungen: %s", url)
+                        continue
+                    fallback = att.name or f"anhang_{idx}"
+                    if "." not in fallback[-6:] and ctype == "application/pdf":
+                        fallback += ".pdf"
+                    item.files.append(
+                        PortalFile(
+                            name=_filename_from_response(resp, fallback),
+                            content=content,
+                            content_type=ctype or None,
+                        )
+                    )
+            except (aiohttp.ClientError, TimeoutError) as err:
+                LOGGER.warning("Download %s fehlgeschlagen: %s", url, err)
+
+
+# ----------------------------------------------------------------------
+# Stundenplan und Vertretungsplan (reine HTML-Auswertung, gut testbar)
+# ----------------------------------------------------------------------
+_TIME_RE = re.compile(r"(\d{1,2})[.:](\d{2})\s*-\s*(\d{1,2})[.:](\d{2})")
+_ENTFALL_RE = re.compile(
+    r"entf[aä]ll|ausfall|f[aä]llt\s+aus|\bfrei\b|unterrichtsfrei", re.IGNORECASE
+)
+
+
+_TEST_RE = re.compile(r"^(kLN|KA|StA|Ex|Test|Kurzarbeit|Stegreif)", re.IGNORECASE)
+
+
+def appointment_kind(classname: str | None, title: str | None = None) -> str:
+    """Art eines Portal-Termins laut Legende: 'schulaufgabe', 'test' oder 'schule'."""
+    cls = (classname or "").lower()
+    if "important" in cls:
+        return "schulaufgabe"
+    if "warning" in cls:
+        return "test"
+    if "info" in cls:
+        return "schule"
+    title = (title or "").strip()
+    if re.match(r"^(SA|Schulaufgabe)\b", title):
+        return "schulaufgabe"
+    if _TEST_RE.match(title):
+        return "test"
+    return "schule"
+
+
+_APPT_TIME_RE = re.compile(
+    r"^\s*(\d{1,2})([:.])(\d{2})(?:\s*(?:-|–|bis)\s*(\d{1,2})[:.](\d{2}))?\s*(Uhr)?\s*(?:<br\s*/?>|$)",
+    re.IGNORECASE,
+)
+_BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+# Nur echte Tags (``<b>``, ``</p>``, ``<!-- -->``), nicht ``<`` als Zeichen („Note < 3“).
+_TAG_RE = re.compile(r"<[a-zA-Z/!][^>]*>")
+
+
+def _hhmm(hour: str, minute: str) -> str | None:
+    h, m = int(hour), int(minute)
+    return f"{h:02d}:{m:02d}" if h < 24 and m < 60 else None
+
+
+def has_html_tag(text: str | None) -> bool:
+    """Enthält der Text echte HTML-Tags (nicht nur ein ``<`` als Zeichen)?"""
+    return bool(text) and _TAG_RE.search(text) is not None
+
+
+def clean_appointment_title(raw: str | None) -> tuple[str, str | None, str | None]:
+    """Termintitel aus dem Portal bereinigen (#24).
+
+    Termine mit Uhrzeit kommen als HTML, z. B. ``14:00 - 16:00<br />5: Lernwerkstatt``.
+    Liefert ``(Titel ohne Tags, Beginn "HH:MM" oder None, Ende "HH:MM" oder None)``.
+    """
+    text = raw or ""
+    start = end = None
+    # „12.10“ allein ist eher ein Datum als eine Uhrzeit: mit Punkt nur mit „Uhr“ oder als Spanne
+    if (m := _APPT_TIME_RE.match(text)) and (m[2] == ":" or m[4] or m[6]):
+        start = _hhmm(m[1], m[3])
+        end = _hhmm(m[4], m[5]) if m[4] else None
+        if start:
+            text = text[m.end() :]
+        else:
+            end = None
+    # Erst Entities auflösen, dann Tags entfernen: so bleibt das Ergebnis stabil,
+    # wenn bereits bereinigte Titel noch einmal durchlaufen (gespeicherte Daten).
+    text = html.unescape(_BR_RE.sub(" ", text))
+    text = _TAG_RE.sub("", _BR_RE.sub(" ", text))
+    text = re.sub(r"\s+", " ", text).strip(" -–:")
+    return text, start, end
+
+
+def portal_appointment(
+    uid: str,
+    short: str | None,
+    title: str | None,
+    classname: str | None,
+    start: datetime | None,
+    end: datetime | None,
+) -> dict[str, Any]:
+    """Termin aus ``pyelternportal`` in das Format der Integration bringen."""
+    short_text, t_start, t_end = clean_appointment_title(short)
+    long_text, l_start, l_end = clean_appointment_title(title)
+    if not t_start:
+        t_start, t_end = l_start, l_end
+    shown = short_text or long_text
+    return {
+        "uid": uid,
+        "title": shown,
+        "detail": long_text if long_text and long_text != shown else None,
+        "kind": appointment_kind(classname, shown),
+        "start": start,
+        "end": end,
+        "time": t_start,
+        "time_end": t_end if t_start else None,
+    }
+
+
+def appointment_subject(title: str | None) -> str | None:
+    """Fach aus 'SA in Deutsch (Mü)' oder 'kLN in Französisch (8_F_8B_Ab) (Ab)'."""
+    if m := re.search(r"\bin\s+([^()]+?)\s*(\(|$)", title or ""):
+        return m[1].strip()
+    return None
+
+
+def _lines(tag: Any) -> list[str]:
+    return [t.strip() for t in tag.find_all(string=True) if t.strip()]
+
+
+# Names in the additional, child-specific table below the weekly grid.
+_TIMETABLE_SUBJECTS = {
+    "D": "Deutsch",
+    "M": "Mathematik",
+    "E": "Englisch",
+    "F": "Französisch",
+    "L": "Latein",
+    "Sp": "Spanisch",
+    "Spa": "Spanisch",
+    "It": "Italienisch",
+    "Gr": "Griechisch",
+    "Ku": "Kunst",
+    "Mu": "Musik",
+    "Geo": "Geographie",
+    "G": "Geschichte",
+    "B": "Biologie",
+    "C": "Chemie",
+    "Ph": "Physik",
+    "Inf": "Informatik",
+    "NuT": "Natur und Technik",
+    "WR": "Wirtschaft und Recht",
+    "Sk": "Sozialkunde",
+    "PuG": "Politik und Gesellschaft",
+    "Ev": "Evang. Religionslehre",
+    "K": "Kath. Religionslehre",
+    "Eth": "Ethik",
+    "Sm": "Sport",
+    "Sw": "Sport",
+    "S": "Sport",
+    "Smw": "Sport",
+    "Spo": "Sport",
+}
+
+
+def _timetable_teachers(
+    soup: bs4.BeautifulSoup,
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Read only the teacher table; group memberships belong to this child."""
+    subjects: dict[str, list[str]] = {}
+    groups: dict[str, list[str]] = {}
+    by_code: dict[str, list[str]] = {}
+    for table in soup.select("#asam_content table"):
+        heading = table.find("b")
+        if not heading or not heading.get_text(" ", strip=True).startswith(
+            "Lehrkräfte von "
+        ):
+            continue
+        section = ""
+        for row in table.find_all("tr"):
+            cells = row.find_all("td", recursive=False)
+            if len(cells) == 1:
+                section = cells[0].get_text(" ", strip=True)
+            elif len(cells) == 2 and section in ("Ganze Klasse", "Geteilte Klassen"):
+                subject, teacher = (c.get_text(" ", strip=True) for c in cells)
+                if not subject or not teacher:
+                    continue
+                target = subjects
+                if section == "Geteilte Klassen":
+                    target = groups
+                    # E.g. 8_PhÜ_8AB_KUR, Physik: keep the course token, including
+                    # exercise/intensive suffixes. Never infer those from base subjects.
+                    course, sep, name = subject.partition(",")
+                    if sep:
+                        tokens = course.strip().split("_")
+                        if len(tokens) < 3:
+                            continue
+                        by_code.setdefault(tokens[-1], []).append(teacher)
+                        token = {"NuTBio": "NuT", "NuTInf": "Inf"}.get(
+                            tokens[1], tokens[1]
+                        )
+                        names = target.setdefault(token, [])
+                        if teacher not in names:
+                            names.append(teacher)
+                        subject = name.strip()
+                        # An intensive/exercise course must not override the
+                        # teacher of the ordinary base subject.
+                        if _TIMETABLE_SUBJECTS.get(tokens[1]) != subject:
+                            continue
+                names = target.setdefault(subject, [])
+                if teacher not in names:
+                    names.append(teacher)
+    # A shared course-code suffix establishes identity; an initial alone does not.
+    aliases = {}
+    for names in by_code.values():
+        full = [n for n in names if not re.search(r"(?:^|\s)[A-ZÄÖÜ]\.", n)]
+        if len(set(full)) == 1:
+            aliases.update({n: full[0] for n in names})
+    for mapping in (subjects, groups):
+        for key, names in mapping.items():
+            mapping[key] = list(dict.fromkeys(aliases.get(n, n) for n in names))
+    return subjects, groups
+
+
+def _lesson_teachers(
+    subject: str, subjects: dict[str, list[str]], groups: dict[str, list[str]]
+) -> str:
+    teachers = []
+    tokens = [token.strip() for token in subject.split("/")]
+    personal = any(
+        groups.get(t) or groups.get(_TIMETABLE_SUBJECTS.get(t, t)) for t in tokens
+    )
+    for token in tokens:
+        name = _TIMETABLE_SUBJECTS.get(token, token)
+        # Specific personal groups take precedence over whole-class lists.
+        specific = groups.get(token) or groups.get(name)
+        if len(tokens) > 1 and personal and not specific:
+            continue
+        names = specific or subjects.get(name, [])
+        # Several whole-class teachers for one subject cannot be assigned to
+        # a particular lesson safely (e.g. boys' and girls' sports).
+        if not specific and len(names) != 1:
+            continue
+        for teacher in names:
+            if teacher not in teachers:
+                teachers.append(teacher)
+    return ", ".join(teachers)
+
+
+def parse_timetable(html: str, parser: str = "html.parser") -> list[dict[str, Any]]:
+    """Stundenplan der Klasse: eine Zeile je Stunde und Wochentag (1 = Montag)."""
+    soup = bs4.BeautifulSoup(html, parser)
+    out: list[dict[str, Any]] = []
+    subjects, groups = _timetable_teachers(soup)
+    for row in soup.select("#asam_content div.table-responsive table tr"):
+        cells = row.find_all("td", recursive=False)
+        if len(cells) < 6:
+            continue
+        head = _lines(cells[0])
+        if not head:
+            continue
+        number = head[0].rstrip(".").strip()
+        start = end = None
+        if m := _TIME_RE.search(" ".join(head)):
+            start = f"{int(m[1]):02d}:{m[2]}"
+            end = f"{int(m[3]):02d}:{m[4]}"
+        for weekday, cell in enumerate(cells[1:7], start=1):
+            inner = cell.select_one("span span") or cell
+            parts = _lines(inner)
+            if not parts:
+                continue
+            subject = parts[0]
+            room = parts[1] if len(parts) > 1 else ""
+            if not subject.strip(" /"):
+                continue
+            out.append(
+                {
+                    "weekday": weekday,
+                    "lesson": number,
+                    "start": start,
+                    "end": end,
+                    "subject": subject,
+                    "room": room.strip(" /") and room,
+                }
+            )
+    for lesson in out:
+        if teacher := _lesson_teachers(lesson["subject"], subjects, groups):
+            lesson["teacher"] = teacher
+    out.sort(key=lambda x: (x["weekday"], _lesson_sort(x["lesson"])))
+    return out
+
+
+def _lesson_sort(value: str) -> tuple[int, str]:
+    m = re.match(r"\d+", value or "")
+    return (int(m[0]) if m else 99, value or "")
+
+
+def substitution_kind(entry: dict[str, Any]) -> str:
+    """'entfall', 'raum' oder 'vertretung'."""
+    text = " ".join(
+        str(entry.get(k) or "") for k in ("substitute", "subject", "room", "info")
+    )
+    if (
+        _ENTFALL_RE.search(text)
+        or entry.get("substitute") in ("---", "–", "-")
+        and not entry.get("room")
+    ):
+        return "entfall"
+    info = (entry.get("info") or "").lower()
+    if "raum" in info and entry.get("substitute") in ("", None, entry.get("teacher")):
+        return "raum"
+    return "vertretung"
+
+
+# Spalten des Vertretungsplans. Je nach Schule zeigt das Portal 6 Spalten (mit „Fach“,
+# altes Fach durchgestrichen) oder 5 Spalten ohne „Fach“ (pyelternportal #7/#8).
+_DEFAULT_SUBST_COLUMNS = ("lesson", "teacher", "substitute", "subject", "room", "info")
+_SHORT_SUBST_COLUMNS = ("lesson", "teacher", "substitute", "room", "info")
+_SUBST_HEADERS = (
+    ("lesson", ("std", "stunde")),
+    ("teacher", ("betrifft", "lehrer", "lehrkraft")),
+    ("substitute", ("vertretung", "vertreter")),
+    ("subject", ("fach",)),
+    ("room", ("raum",)),
+    ("info", ("info", "bemerkung", "hinweis", "text")),
+)
+
+
+def _substitution_columns(row: Any) -> tuple[str, ...] | None:
+    """Spaltenzuordnung aus der Kopfzeile (``tr.vp_plan_head``)."""
+    cols: list[str] = []
+    for cell in row.find_all("td", recursive=False):
+        text = cell.get_text(" ", strip=True).lower().rstrip(".")
+        key = next(
+            (
+                k
+                for k, words in _SUBST_HEADERS
+                if any(text.startswith(w) for w in words)
+            ),
+            None,
+        )
+        if key is None or key in cols:
+            return None
+        cols.append(key)
+    if not {"lesson", "room", "info"} <= set(cols):
+        return None
+    return tuple(cols)
+
+
+def parse_substitutions(html: str, parser: str = "html.parser") -> dict[str, Any]:
+    """Vertretungsplan: {'available', 'stand', 'days': [{'date', 'entries'}]}."""
+    soup = bs4.BeautifulSoup(html, parser)
+    center = soup.select_one("#asam_content .main_center")
+    result: dict[str, Any] = {
+        "available": center is not None,
+        "stand": None,
+        "days": [],
+    }
+    if center is None:
+        return result
+    if m := re.search(r"Stand:?\s*([\d.]+\s*[\d:]*)", center.get_text(" ")):
+        result["stand"] = m[1].strip()
+    day: dict[str, Any] | None = None
+    for tag in center.find_all(["div", "table"], recursive=False):
+        if tag.name == "div" and "list" in (tag.get("class") or []):
+            if m := re.search(r"(\d{2})\.(\d{2})\.(\d{4})", tag.get_text()):
+                iso = f"{m[3]}-{m[2]}-{m[1]}"
+                day = next((d for d in result["days"] if d["date"] == iso), None)
+                if day is None:
+                    day = {"date": iso, "entries": []}
+                    result["days"].append(day)
+            continue
+        if tag.name != "table" or day is None:
+            continue
+        cols = _DEFAULT_SUBST_COLUMNS
+        for row in tag.select("tr"):
+            if "vp_plan_head" in (row.get("class") or []):
+                cols = _substitution_columns(row) or cols
+                continue
+            cells = row.find_all("td", recursive=False)
+            if len(cells) < 5:
+                continue  # z. B. "Keine Vertretungen für …" (eine Zelle)
+            if len(cols) != len(cells):
+                cols = (
+                    _DEFAULT_SUBST_COLUMNS if len(cells) >= 6 else _SHORT_SUBST_COLUMNS
+                )
+            cell = dict(zip(cols, cells))
+            subject_cell = cell.get("subject")
+            old: list[str] = []
+            if subject_cell is not None:
+                old = [
+                    sp.get_text(strip=True)
+                    for sp in subject_cell.select("span[style*='line-through']")
+                ]
+                for span in subject_cell.select("span[style*='line-through']"):
+                    span.decompose()
+
+            def _text(key: str, sep: str = "", *, values: dict[str, Any] = cell) -> str:
+                c = values.get(key)
+                return c.get_text(sep, strip=True) if c is not None else ""
+
+            entry = {
+                "lesson": re.sub(r"\.(?=\s*[-–])", "", _text("lesson")).removesuffix(
+                    "."
+                ),
+                "teacher": _text("teacher"),
+                "substitute": _text("substitute"),
+                "subject": _text("subject", " "),
+                "old_subject": " ".join(o for o in old if o) or None,
+                "room": _text("room"),
+                "info": _text("info", " "),
+            }
+            if entry["old_subject"] == entry["subject"]:
+                entry["old_subject"] = None
+            entry["kind"] = substitution_kind(entry)
+            day["entries"].append(entry)
+    return result
+
+
+_HEADINGS = ("h1", "h2", "h3", "h4", "h5")
+
+
+def parse_teachers(html: str, parser: str = "html.parser") -> dict[str, str] | None:
+    """Stundenplankürzel der Lehrkräfte aus den Schulinformationen.
+
+    Aufbau im Portal: Überschrift "Stundenplankürzel der Lehrkräfte", danach je
+    Lehrkraft eine ``div.row`` mit dem Kürzel in ``<b>`` (doppelt, für breite und
+    schmale Bildschirme) und dem Namen in ``div.col-md-6``. Gibt ``None`` zurück,
+    wenn die Seite keinen solchen Abschnitt hat.
+    """
+    soup = bs4.BeautifulSoup(html, parser)
+    head = next(
+        (
+            h
+            for h in soup.find_all(_HEADINGS)
+            if re.search(r"k[uü]e?rzel", h.get_text(), re.IGNORECASE)
+            and re.search(r"lehr", h.get_text(), re.IGNORECASE)
+        ),
+        None,
+    )
+    if head is None:
+        return None
+    out: dict[str, str] = {}
+
+    def add(abbr: str, name: str) -> None:
+        abbr = re.sub(r"\s+", " ", abbr).strip().rstrip(":")
+        name = re.sub(r"\s+", " ", name).strip(" :-–")
+        if abbr and name and name != abbr and abbr not in out:
+            out[abbr] = name
+
+    # Tabellen-Variante (falls ein Portal die Liste als Tabelle zeigt)
+    table = head.find_next("table")
+    container = head.find_parent(class_="row") or head.parent
+    if container is not None and container.name != "body":
+        for row in container.find_next_siblings():
+            if row.find(_HEADINGS) or row.name in _HEADINGS:
+                break
+            bold = row.find("b")
+            if bold is None:
+                continue
+            abbr = bold.get_text()
+            value = row.select_one(".col-md-6, .col-md-8, .col-sm-8, .col-xs-8")
+            if value is not None:
+                name = value.get_text(" ")
+            else:
+                for b in row.find_all("b"):
+                    b.decompose()
+                name = row.get_text(" ")
+            add(abbr, name)
+    if not out and table is not None:
+        nxt = table.find_previous(_HEADINGS)
+        if nxt is head:
+            for tr in table.find_all("tr"):
+                cells = [c.get_text(" ") for c in tr.find_all(["td", "th"])]
+                if len(cells) >= 2 and not re.search(
+                    r"k[uü]rzel", cells[0], re.IGNORECASE
+                ):
+                    add(cells[0], cells[1])
+    return out
+
+
+async def async_validate(
+    session: aiohttp.ClientSession, school: str, username: str, password: str
+) -> str:
+    """Zugangsdaten prüfen; gibt den Schulnamen zurück."""
+    api = PortalClient(session, school, username, password)
+    await api.async_validate_config()
+    return (api.school_name or school).strip()
+
+
+__all__ = [
+    "PortalAttachment",
+    "PortalAuthError",
+    "PortalChild",
+    "PortalClient",
+    "PortalConnectionError",
+    "PortalFile",
+    "PortalItem",
+    "PortalResult",
+    "appointment_kind",
+    "appointment_subject",
+    "async_validate",
+    "clean_appointment_title",
+    "has_html_tag",
+    "parse_substitutions",
+    "parse_teachers",
+    "parse_timetable",
+    "portal_appointment",
+    "pyelternportal",
+    "school_from_input",
+]
