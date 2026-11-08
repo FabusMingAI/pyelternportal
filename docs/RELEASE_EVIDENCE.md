@@ -14,6 +14,10 @@ The original files remain Unlicense. The extracted extensions, counts client and
 - CI tests Python 3.13/3.14 with external network disabled, builds the wheel/sdist and checks archive/source/license correspondence.
 - The tag-only publication workflow checks tag/version agreement, tests, builds, validates, attests artifacts and publishes through a PyPI trusted publisher.
 
+## Public preparation build
+
+[The first public build](https://github.com/FabusMingAI/pyelternportal/actions/runs/42474822254) passed tests, wheel/sdist builds and archive checks on Python 3.13 and 3.14 at commit `53e6b27d4bb6c6a733696897db2084f1a548c51d`. Later commits additionally enforce the per-module coverage thresholds in CI. This is a development-branch build, not a PyPI release or an upstream acceptance.
+
 ## Before any actual publication
 
 The package owner must review and accept this contribution, choose the release version, and configure the PyPI trusted publisher with the actual repository owner/name, workflow `publish.yml`, and environment `pypi`. Repository/environment protection should ensure only reviewed release tags are published. Do not configure a publisher for a repository you do not control, and do not put PyPI tokens in source files.

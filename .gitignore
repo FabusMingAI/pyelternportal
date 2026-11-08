@@ -16,3 +16,5 @@ test*.py
 !tests/test*.py
 .coverage
 .pytest_cache/
+coverage.json
+coverage.xml
