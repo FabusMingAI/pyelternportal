@@ -1,0 +1,1 @@
+client.py, counts.py, registrations.py, scripts and extension tests derive from FabusMingAI/ha-schulmanager v0.14.8 (MIT), copyright 2026 FabusMingAI and contributors. See LICENSE.extensions. Existing upstream pyelternportal files remain under the Unlicense (LICENSE).

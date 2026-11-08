@@ -10,3 +10,9 @@ dist/
 # Test
 setup.py
 test*.py
+
+# Keep the standalone regression suite in version control.
+!tests/
+!tests/test*.py
+.coverage
+.pytest_cache/
